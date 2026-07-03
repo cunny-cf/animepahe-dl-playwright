@@ -315,8 +315,8 @@ You can manually edit `config.json` to change defaults for quality, audio, threa
 
 2. **Clone the repository:**
    ```bash
-   git clone https://github.com/ayushjaipuriyar/animepahe-dl.git
-   cd animepahe-dl
+   git clone https://github.com/cunny-cf/animepahe-dl-playwright.git
+   cd animepahe-dl-playwright
    ```
 
 3. **Install dependencies with uv:**
