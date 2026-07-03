@@ -8,43 +8,149 @@ import os
 import re
 import ssl
 import subprocess
+import threading
 import time
 import warnings
 from http.cookies import SimpleCookie
+from queue import Queue
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import urllib3
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 from urllib3.exceptions import InsecureRequestWarning
 
 from anime_downloader.utils import config_manager
-
 from ..models import Anime, Episode
 from ..utils import constants, logger
 
 
 class AnimePaheAPI:
-    """
-    A class to interact with the AnimePahe website and its API.
-    Provides methods for searching anime, fetching episodes,
-    getting stream URLs, and managing the local cache.
-    """
-
-    def __init__(self, verify_ssl: bool = True):  # verify_ssl kept for compatibility
-        """Initializes the API with an HTTP client (forced insecure)."""
-        self.verify_ssl = False  # Force insecure
+    def __init__(self, verify_ssl: bool = True):
+        self.verify_ssl = False
         self._insecure_fallback_used = True
-
-        # Generate session cookie like the bash script
-        self.session_cookie = self._generate_session_cookie()
-
-        self.http = self._build_pool(False)
-        # Suppress urllib3 insecure request warnings since user explicitly forced insecure mode
+        
+        # Threading infrastructure for persistent browser
+        self.request_queue = Queue()
+        self.browser_lock = threading.Lock()
+        self.browser_initialized = False
+        
+        # Start the persistent browser in a background daemon thread
+        threading.Thread(target=self._browser_thread, daemon=True).start()
+        
         warnings.simplefilter("ignore", InsecureRequestWarning)
-
-        # Best-effort startup probe to refresh cookies and follow the current host.
+        
+        # Original session and pool initialization
+        self.session_cookie = self._generate_session_cookie()
+        self.http = self._build_pool(False)
         self.startup_probe()
+
+    def _browser_thread(self):
+        """Dedicated thread for Playwright browser management."""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                channel="msedge",
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_default_args=["--enable-automation"]
+            )
+            context = browser.new_context(viewport={"width": 1280, "height": 720})
+
+            page = context.new_page()
+
+            # --- AD & POPUP BLOCKER START ---
+            
+            # 1. Kill popups specifically spawned by our main page (ignores the main tab)
+            page.on("popup", lambda popup: popup.close())
+            
+            # 2. Network Interceptor to block ad scripts and redirects
+            def block_ads_and_redirects(route):
+                url = route.request.url.lower()
+                
+                # Block common ad networks
+                ad_keywords = ["popads", "propellerads", "exoclick", "syndication", "ad-delivery", "adxxx"]
+                if any(kw in url for kw in ad_keywords):
+                    route.abort()
+                    return
+                
+                # Block forced page redirects
+                if route.request.resource_type == "document":
+                    allowed_domains = ["animepahe", "kwik", "cloudflare", "turnstile"]
+                    if not any(safe in url for safe in allowed_domains):
+                        logger.warning(f"Blocked ad redirect to: {url}")
+                        route.abort()
+                        return
+                        
+                route.continue_()
+                
+
+            # Apply the interceptor to the main page
+            page.route("**/*", block_ads_and_redirects)
+            # --- AD & POPUP BLOCKER END ---
+            
+            with self.browser_lock:
+                self.page = page
+                self.browser_initialized = True
+            
+            while True:
+                task = self.request_queue.get()
+                url = task['url']
+                referer = task.get('referer')  # Get the referer if it exists
+                result_container = task['result']
+                
+                try:
+                    # Pass the referer to Playwright
+                    if referer:
+                        page.goto(url, wait_until="networkidle", referer=referer)
+                    else:
+                        page.goto(url, wait_until="networkidle")
+                    
+                    # Handle Cloudflare Verification
+                    while "Just a moment" in page.title() or "Cloudflare" in page.title():
+                        time.sleep(1)
+                        
+                    # Capture raw content
+                    result_container['data'] = page.content()
+                except Exception as e:
+                    logger.error(f"Browser error for {url}: {e}")
+                    result_container['data'] = None
+                finally:
+                    result_container['event'].set()
+                self.request_queue.task_done()
+                
+
+    def _request(self, url: str, referer: Optional[str] = None) -> Optional[Any]:
+        """Routes all requests through the persistent browser."""
+        while not self.browser_initialized:
+            time.sleep(0.5)
+            
+        result = {'data': None, 'event': threading.Event()}
+        
+        # Add the referer to the queue payload
+        self.request_queue.put({'url': url, 'referer': referer, 'result': result})
+        result['event'].wait()
+        
+        content = result['data']
+        if not content:
+            return None
+            
+        class MockResponse:
+            def __init__(self, content_str):
+                # Clean content: if JSON, get just the text; if HTML, keep it
+                soup = BeautifulSoup(content_str, "html.parser")
+                body_text = soup.body.get_text().strip() if soup.body else ""
+                
+                # Heuristic: If it looks like JSON, return that, otherwise return raw HTML
+                if body_text.startswith('{') or body_text.startswith('['):
+                    self.data = body_text.encode('utf-8')
+                else:
+                    self.data = content_str.encode('utf-8')
+                self.status = 200
+                self.headers = {}
+            def close(self): pass
+            
+        return MockResponse(content)
 
     def _generate_session_cookie(self) -> str:
         """Generate a session cookie like the bash script does."""
@@ -60,6 +166,8 @@ class AnimePaheAPI:
         # Add cookie to headers
         headers = constants.HTTP_HEADERS.copy()
         headers["Cookie"] = self.session_cookie
+
+        headers["Referer"] = f"{constants.get_base_url().rstrip('/')}/"
 
         if verify:
             return urllib3.PoolManager(10, headers=headers, cert_reqs="CERT_REQUIRED")
@@ -159,148 +267,6 @@ class AnimePaheAPI:
             except Exception:
                 pass
 
-    # Return type annotated as Any to accommodate urllib3's BaseHTTPResponse hierarchy without strict mismatch
-    def _request(self, url: str, redirect_count: int = 0) -> Optional[Any]:
-        """
-        Makes a GET request with retries and exponential backoff.
-
-        Args:
-            url (str): The URL to request.
-
-        Returns:
-            Optional[Any]: Response object or None.
-        """
-
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logger.debug(f"Making request to: {url}")
-
-        MAX_REDIRECTS = 5
-
-        for attempt in range(constants.MAX_RETRIES):
-            try:
-                response = self.http.request("GET", url, preload_content=False, timeout=60)
-                status = getattr(response, "status", None)
-
-                # Successful response
-                if status == 200:
-                    if logging.getLogger().isEnabledFor(logging.DEBUG):
-                        logger.debug(f"Request successful: {url} (status: {status})")
-                    return response
-
-                # Handle redirects (follow and guard against loops)
-                if status in (301, 302, 303, 307, 308):
-                    print(f"Received redirect (status {status}) for {url}")
-                    location = response.headers.get("location") or response.headers.get("Location")
-                    if not location:
-                        logger.error("Redirect without Location header")
-                        try:
-                            response.close()
-                        except Exception:
-                            pass
-                        return None
-
-                    if redirect_count >= MAX_REDIRECTS:
-                        logger.error(f"Max redirects ({MAX_REDIRECTS}) reached for {url}")
-                        try:
-                            response.close()
-                        except Exception:
-                            pass
-                        return None
-
-                    redirect_url = urljoin(url, location)
-                    logger.info(f"Following redirect to: {redirect_url}")
-                    try:
-                        response.close()
-                    except Exception:
-                        pass
-                    return self._request(redirect_url, redirect_count + 1)
-
-                # Forbidden -> probe the site's root for a canonical redirect and follow it (no config changes)
-                if status == 403:
-                    try:
-                        body = getattr(response, "data", b"")
-                        try:
-                            snippet = body[:400].decode("utf-8", errors="replace")
-                        except Exception:
-                            snippet = str(body)[:400]
-                        logger.warning(
-                            f"Received status code 403 for {url}. Headers: {dict(response.headers)} Body snippet: {snippet}"
-                        )
-                    except Exception:
-                        logger.warning(f"Received status code 403 for {url}.")
-
-                    try:
-                        response.close()
-                    except Exception:
-                        pass
-
-                    retry_url = self.startup_probe(url)
-                    if retry_url:
-                        return self._request(retry_url, redirect_count + 1)
-
-                    # Nothing to follow; fall through to retry/backoff
-                    continue
-
-                # Other non-200 status codes
-                try:
-                    body = getattr(response, "data", b"")
-                    try:
-                        snippet = body[:400].decode("utf-8", errors="replace")
-                    except Exception:
-                        snippet = str(body)[:400]
-                    logger.warning(f"Received status code {status} for {url}. Headers: {dict(response.headers)} Body snippet: {snippet}")
-                except Exception:
-                    logger.warning(f"Received status code {status} for {url}.")
-                try:
-                    response.close()
-                except Exception:
-                    pass
-            except urllib3.exceptions.SSLError as e:
-                # Certificate verification failure handling / optional insecure fallback
-                msg = str(e)
-                if "CERTIFICATE_VERIFY_FAILED" in msg and self.verify_ssl:
-                    logger.warning(
-                        "SSL certificate verification failed. You can retry with --insecure (CLI) or set 'allow_insecure_ssl': true in config.json (NOT RECOMMENDED)."
-                    )
-                    # One-time automatic fallback if user already opted in via config
-                    try:
-
-                        cfg = config_manager.load_config()
-                        if cfg.get("allow_insecure_ssl") and not self._insecure_fallback_used:
-                            logger.warning(
-                                "Attempting insecure (certificate verification disabled) retry. Traffic may be intercepted."
-                            )
-                            self.http = self._build_pool(False)
-                            self._insecure_fallback_used = True
-                            # Do not count this attempt; retry immediately
-                            continue
-                    except Exception:
-                        pass
-                logger.warning(f"A network error occurred: {e}")
-            except (
-                urllib3.exceptions.MaxRetryError,
-                urllib3.exceptions.HTTPError,
-                urllib3.exceptions.TimeoutError,
-                urllib3.exceptions.InvalidHeader,
-                urllib3.exceptions.ProxyError,
-            ) as e:
-                logger.warning(f"A network error occurred: {e}")
-            except Exception as e:
-                logger.error(f"An unexpected error occurred: {e}")
-                return None  # Don't retry on unexpected errors
-
-            if attempt < constants.MAX_RETRIES - 1:
-                sleep_time = constants.BACKOFF_FACTOR ** (attempt + 1)
-                logger.info(
-                    f"Retrying in {sleep_time} seconds... ({attempt + 1}/{constants.MAX_RETRIES})"
-                )
-                time.sleep(sleep_time)
-            else:
-                logger.error(f"Failed to download {url} after {constants.MAX_RETRIES} attempts.")
-                return None
-
-        return None
-
     def search(self, query: str) -> List[Dict[str, str]]:
         """
         Searches for anime on AnimePahe.
@@ -331,15 +297,10 @@ class AnimePaheAPI:
                         if not query or query.lower() in title.lower():
                             search_results.append({"session": slug, "title": title})
 
-                # If we found matches (or query was empty and we got list), return local results
-                # Only return if we actually found something. If not, maybe fallback to API?
-                # But if cache exists and we found nothing, API probably won't find it either unless cache is stale.
-                # Given API limits, cache is better source of truth.
                 if search_results:
                     return search_results
 
                 if not query and not search_results:
-                    # Empty cache file?
                     return []
 
         except Exception as e:
@@ -351,9 +312,6 @@ class AnimePaheAPI:
             )
             return []
 
-        # Fallback to API if cache didn't exist or had error (or maybe no results found locally)
-        # Note: If cache existed but had 0 matches, we still fall back to API here just in case
-        # the cache is stale and API has new show.
         response = self._request(f"{constants.SEARCH_URL}&q={query}")
         if response:
             data = json.loads(response.data)
@@ -395,15 +353,6 @@ class AnimePaheAPI:
     ) -> Optional[str]:
         """
         Gets the final stream URL for a specific episode with flexible quality and audio selection.
-
-        Args:
-            anime_slug (str): Anime session ID.
-            episode_session (str): Episode session ID.
-            quality (str): Desired quality (e.g., '720', '1080', 'best').
-            audio (str): Desired audio language (e.g., 'jpn', 'eng').
-
-        Returns:
-            Optional[str]: Direct stream URL or None.
         """
         play_url = f"{constants.PLAY_URL}/{anime_slug}/{episode_session}"
         response = self._request(play_url)
@@ -414,7 +363,6 @@ class AnimePaheAPI:
         soup = BeautifulSoup(response.data, "html.parser")
         buttons = soup.find_all("button", attrs={"data-src": True, "data-av1": "0"})
 
-        # Extract only the primitive values we need into plain Python dicts
         streams: List[Dict[str, Any]] = []
         for b in buttons:
             streams.append(
@@ -429,13 +377,11 @@ class AnimePaheAPI:
             logger.warning("No streams found on the page.")
             return None
 
-        # Log available streams for debugging
         available_streams_str = ", ".join(
             [f"{s['quality']}p ({s['audio']})" for s in streams if s.get("quality")]
         )
         logger.info(f"Available streams: {available_streams_str}")
 
-        # Convert quality to integer for sorting, handle non-numeric qualities
         for s in streams:
             q_raw = s.get("quality")
             try:
@@ -443,16 +389,13 @@ class AnimePaheAPI:
             except (ValueError, TypeError):
                 s["quality_val"] = 0
 
-        # Sort streams by quality descending
         streams.sort(key=lambda s: int(s.get("quality_val", 0)), reverse=True)
 
-        # --- Audio Selection ---
         audio_streams = [s for s in streams if s.get("audio") == audio]
         if not audio_streams:
             logger.warning(f"Audio '{audio}' not found. Selecting from available audio languages.")
-            audio_streams = streams  # Fallback to all streams
+            audio_streams = streams
 
-        # --- Quality Selection ---
         selected_stream = None
         if quality == "best":
             if audio_streams:
@@ -460,12 +403,10 @@ class AnimePaheAPI:
         else:
             try:
                 target_quality = int(quality)
-                # Find best match: exact or next best available
                 for stream in audio_streams:
                     if int(stream.get("quality_val", 0)) <= target_quality:
                         selected_stream = stream
                         break
-                # If no stream is <= target, pick the best available (first in sorted list)
                 if not selected_stream and audio_streams:
                     selected_stream = audio_streams[0]
                     logger.warning(
@@ -490,20 +431,16 @@ class AnimePaheAPI:
     def get_playlist_url(self, stream_url: str) -> Optional[str]:
         """
         Extracts the m3u8 playlist URL from the stream page.
-
-        Args:
-            stream_url (str): URL of the stream page.
-
-        Returns:
-            Optional[str]: m3u8 playlist URL or None.
         """
-        response = self._request(stream_url)
+        # Inject the Referer when requesting kwik.cx via Playwright
+        referer_url = f"{constants.get_base_url().rstrip('/')}/"
+        response = self._request(stream_url, referer=referer_url)
+        
         if not response:
             logger.error("Failed to get playlist page.")
             return None
 
         soup = BeautifulSoup(response.data, "html.parser")
-        # Find all script tags and inspect their string content
         scripts = soup.find_all("script")
         for script in scripts:
             script_text = script.string or ""
@@ -534,8 +471,6 @@ class AnimePaheAPI:
 
         Returns:
             int: Number of entries written to the cache file.
-                 -1 indicates a download/network failure (existing cache left untouched).
-                 0 indicates the request succeeded but no entries were parsed (likely site layout change or empty response).
         """
         logger.info("Updating anime list cache...")
         response = self._request(f"{constants.get_base_url()}/anime/")
@@ -556,7 +491,6 @@ class AnimePaheAPI:
                         href_str = str(href)
                         uuid = href_str.split("/")[-1]
                         name = a_tag.text.strip()
-                        # Skip obviously empty lines
                         if not uuid or not name:
                             continue
                         f.write(f"{uuid}::::{name}\n")
