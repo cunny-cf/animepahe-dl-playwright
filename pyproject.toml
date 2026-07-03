@@ -41,6 +41,7 @@ dependencies = [
     "questionary>=2.0.0",
     "rich>=13.0.0",
     "typer>=0.9.0",
+    "playwright>=1.48.0",
 ]
 
 [project.optional-dependencies]
