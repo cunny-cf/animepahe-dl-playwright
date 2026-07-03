@@ -11,6 +11,10 @@
 
 A feature-rich, high-performance anime downloader for AnimePahe with both CLI and GUI interfaces. Built with Python, featuring concurrent downloads, resume support, and cross-platform compatibility.
 
+> [!Caution]
+> Check [This Fork](#this-fork)'s information before continuing.
+> This fork is created with the help of AI
+
 ![Screenshot](ss1.png)
 
 ## 📋 Table of Contents
@@ -27,6 +31,7 @@ A feature-rich, high-performance anime downloader for AnimePahe with both CLI an
 - [Docker Support](#-docker-support)
 - [Advanced Usage](#-advanced-usage)
 - [New Features](#-new-features-in-v521)
+- [This Fork](#this-fork)
 - [License](#-license)
 - [Acknowledgments](#-acknowledgments)
 
@@ -289,6 +294,14 @@ You can manually edit `config.json` to change defaults for quality, audio, threa
   "allow_insecure_ssl": true
 }
 ```
+## This Fork
+
+- This is an AI helped fork with the intent to try and fix the cloudflare challege using playwright.
+- The playwright browser being used is edge by default as using the system's (windows) browser seems to work way better than freshly installed browser for the challenge.
+- This routes majority of requests to playwright as we need to use the browser for loading the pages required.
+- This is inteded for the gui version `python launcher.py --gui` and never tested for cli
+- You need to manually install this to make it work, check the [Development Setup](#️-for-developers) using uv
+- Make sure to be in the virtual environment before running this `.venv\Scripts\activate` then run `python launcher.py` or directly `.venv\Scripts\python.exe launcher.py --gui`
 
 ## 🛠️ For Developers
 
